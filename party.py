@@ -6,15 +6,16 @@
 import re
 
 # Remove when we are on python 3.x :)
-from orderedset import OrderedSet
-from lxml import etree
 from logbook import Logger
 
 from ups.worldship_api import WorldShip
 from ups.shipping_package import ShipmentConfirm
-from ups.base import PyUPSException
 from trytond.pool import Pool, PoolMeta
 from trytond.transaction import Transaction
+
+import fulfil_shipping
+from fulfil_shipping.validators import UPSClient
+from fulfil_shipping.exceptions import ShippingException
 
 
 __all__ = ['Address']
@@ -37,6 +38,17 @@ class Address:
             'ups_field_missing':
                 '%s is missing in %s.'
         })
+
+    @property
+    def fulfil_shipping_obj(self):
+        return fulfil_shipping.Address(
+            name=self.name,
+            street1=self.street,
+            city=self.city,
+            zip=self.zip,
+            state=self.subdivision and self.subdivision.code.split('-')[1],
+            country=self.country and self.country.code,
+        )
 
     def _get_ups_address_xml(self):
         """
@@ -227,77 +239,23 @@ class Address:
                 "Validation Carrier is not selected in party configuration."
             )
 
-        api_instance = carrier.ups_api_instance(call='address_val')
-
-        if not self.country:
-            # XXX: Either this or assume it is the US of A
-            self.raise_user_error('Country is required to validate address.')
-
-        values = {
-            'CountryCode': self.country.code,
-        }
-
-        if self.subdivision:
-            # Fetch ups compatible subdivision
-            values['StateProvinceCode'] = self.subdivision.code.split('-')[-1]
-
-        if self.city:
-            values['City'] = self.city
-
-        if self.zip:
-            values['PostalCode'] = self.zip
-
-        address_request = api_instance.request_type(**values)
-
-        # Logging.
-        logger.debug(
-            'Making Address Validation Request to UPS for Address Id: {0}'
-            .format(self.id)
-        )
-        logger.debug(
-            '--------AV API REQUEST--------\n%s'
-            '\n--------END REQUEST--------'
-            % etree.tostring(address_request, pretty_print=True)
+        client = UPSClient(
+            license_number=carrier.ups_license_key,
+            user_id=carrier.ups_user_id,
+            password=carrier.ups_password,
+            test_mode=carrier.ups_is_test,
         )
 
         try:
-            address_response = api_instance.request(address_request)
+            response, = client.validate(self.fulfil_shipping_obj)
+        except ShippingException as exc:
+            self.raise_user_error(
+                  "Error while validating address: %s" % exc.message[1]
+              )
 
-            # Logging.
-            logger.debug(
-                '--------AV API RESPONSE--------\n%s'
-                '\n--------END RESPONSE--------'
-                % etree.tostring(address_response, pretty_print=True)
-            )
-        except PyUPSException, exc:
-            self.raise_user_error(unicode(exc[0]))
-
-        if (len(address_response.AddressValidationResult) == 1) and \
-                address_response.AddressValidationResult.Quality.pyval == 1:
-            # This is a perfect match and there is no need to make
-            # suggestions.
+        if response['valid'] and not response['suggestions']:
+            # Perfect match
             return True
-
-        # The UPS response will include the following::
-        #
-        #   * City
-        #   * StateProvinceCode
-        #   * PostalCodeLowEnd  (Not very useful)
-        #   * PostalCodeHighEnd (Not Very Useful)
-        #
-        # Example: https://gist.github.com/tarunbhardwaj/4df0673bdd1c7bc6ab89
-        #
-        # The approach here is to clear out the duplicates with just city
-        # and the state and only return combinations of address which
-        # differentiate based on city and state.
-        #
-        # (In most practical uses, it would just be the city that keeps
-        # changing).
-
-        unique_combinations = OrderedSet([
-            (node.Address.City.text, node.Address.StateProvinceCode.text)
-            for node in address_response.AddressValidationResult
-        ])
 
         # This part is sadly static... wish we could verify more than the
         # state and city... like the street.
@@ -309,11 +267,11 @@ class Address:
             'zip': self.zip,
         }
         matches = []
-        for city, subdivision_code in unique_combinations:
+        for address in response['suggestions']:
             try:
                 subdivision, = Subdivision.search([
                     ('code', '=', '%s-%s' % (
-                        self.country.code, subdivision_code
+                        self.country.code, address['state']
                     ))
                 ])
             except ValueError:
@@ -321,7 +279,7 @@ class Address:
                 # we wont be able to save the address anyway.
                 continue
 
-            if (self.city.upper() == city.upper()) and \
+            if (self.city.upper() == address['city'].upper()) and \
                     (self.subdivision == subdivision):
                 # UPS does not know it, but this is a right address too
                 # because we are suggesting exactly what is already in the
@@ -329,7 +287,8 @@ class Address:
                 return True
 
             matches.append(
-                Address(city=city, subdivision=subdivision, **base_address)
+                Address(
+                    city=address['city'], subdivision=subdivision, **base_address)
             )
 
         return matches
